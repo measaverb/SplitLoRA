@@ -1,0 +1,62 @@
+{
+  "distributed": {
+    "local_rank": 0,
+    "rank": 0,
+    "device": 0,
+    "world_size": 0,
+    "random_seed": 10
+  },
+  "optimizer": {
+    "lr": 0.00001,
+    "weight_decay": 0.01,
+    "correct_bias": true,
+    "adam_epsilon": 1e-6,
+    "no_decay_bias": false,
+    "adam_beta1": 0.9,
+    "adam_beta2": 0.98
+  },
+  "scheduler": {
+    "type": "linear",
+    "max_step": null,
+    "max_epoch": null,
+    "warmup_step": 0,
+    "i_steps": "0",
+    "i_lrs": "0.00025"
+  },
+  "data": {
+    "train_data_c0": "/path/to/train_data_c0",
+    "train_data_c1": "/path/to/train_data_c1",
+    "train_data_c2": "/path/to/train_data_c2",
+    "valid_data": "/path/to/valid_data",
+    "train_batch_size": 8,
+    "valid_batch_size": 4,
+    "seq_len": 512
+  },
+  "training": {
+    "grad_acc": 1,
+    "clip": 0.0,
+    "fp16": false,
+    "log_interval": 100,
+    "eval_interval": 2000,
+    "save_interval": 500,
+    "work_dir": "gpt2_model"
+  },
+  "model": {
+    "model_card": "gpt2.md",
+    "init_checkpoint": null,
+    "obj": "clm",
+    "label_smooth": 0.0,
+    "split_point": 3
+  },
+  "lora": {
+    "lora_dim": 0,
+    "lora_alpha": 128,
+    "lora_dropout": 0.0
+  },
+  "rolling": {
+    "roll_interval": -1,
+    "roll_lr": 0.00001,
+    "roll_step": 100,
+    "eval_epoch": 1
+  }
+}

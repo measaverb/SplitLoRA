@@ -1,87 +1,20 @@
 import argparse
 import copy
 import itertools
+import json
 import math
 import os
-import random
 import time
-import warnings
 
 import loralib as lora
-import pandas as pd
 import torch
-from torch.utils.data import DataLoader
+import torch.distributed
+import wandb
 
-from datasets import FTDataset
+from datasets import get_dataloaders
 from networks import ClientGPT2LMModel, GPT2Config, ServerGPT2LMModel
-from utils.experiments import create_exp_dir
-from utils.gpu import (
-    add_gpu_params,
-    cleanup,
-    distributed_opt,
-    distributed_sync,
-    parse_gpu,
-)
-from utils.optimizer import (
-    add_optimizer_params,
-    create_adam_optimizer_from_args,
-    create_optimizer_scheduler,
-)
-
-
-# influence model, calculate the influence score between two samples.
-def print_args(args):
-    if args.rank == 0:
-        print("=" * 100)
-        for k, v in args.__dict__.items():
-            print(f"        - {k} : {v}")
-        print("=" * 100)
-
-
-def save_checkpoint(w_glob_client, model_server, args, train_step, num_clients):
-    if args.rank != 0:
-        return
-
-    model_state_dict = {}
-
-    # rename the key in client model
-    for key, value in w_glob_client.items():
-        new_key = ""
-        if key.startswith("transformer_Client"):
-            new_key = key.replace("transformer_Client", "module.transformer")
-            model_state_dict[new_key] = value
-        else:
-            model_state_dict[key] = value
-
-    # rename the key in server model
-    for key, value in model_server.state_dict().items():
-        new_key = ""
-        # print(key)
-        if key.startswith("module.transformer_Server"):
-            new_key = key.replace("module.transformer_Server", "module.transformer")
-        else:
-            print(key)
-            model_state_dict[key] = value
-
-        if new_key.startswith("module.transformer.h."):
-            parts = key.split(".")
-            layer_idx = int(parts[3])
-            new_key = ".".join(["module.transformer.h", str(layer_idx + 3)] + parts[4:])
-            model_state_dict[new_key] = value
-        else:
-            model_state_dict[new_key] = value
-    if args.model_card == "gpt2.md":
-        model_path = os.path.join(
-            "./trained_models/GPT2_M/e2e",
-            f"model_sfl.{train_step}_r={args.lora_dim}_num={num_clients}_block=3_seed={args.random_seed}.pt",
-        )
-    if args.model_card == "gpt2.sm":
-        model_path = os.path.join(
-            "./trained_models/GPT2_S/e2e",
-            f"model_sfl.{train_step}_r={args.lora_dim}_num={num_clients}_block=3_seed={args.random_seed}.pt",
-        )
-    print("saving checkpoint", model_path)
-    torch.save({"model_state_dict": model_state_dict}, model_path)
+from utils.experiments import AverageMeter, save_checkpoint
+from utils.optimizer import get_optimizer, get_scheduler
 
 
 def fed_avg(w):
@@ -93,157 +26,102 @@ def fed_avg(w):
     return w_avg
 
 
-class AverageMeter(object):
-    def __init__(self):
-        self.reset()
-
-    def reset(self):
-        self.val = 0
-        self.avg = 0
-        self.sum = 0
-        self.count = 0
-
-    def update(self, val, n=1):
-        self.val = val
-        self.sum += val * n
-        self.count += n
-        self.avg = self.sum / self.count
-
-
 def optimizer_step(
     _loss,
-    optimizer_server,
-    model_server,
-    optimizer_client,
+    server_optimizer,
+    server_model,
+    client_optimizer,
     _schedule,
     client_hidden_states,
     hidden_states,
     args,
     is_update=True,
 ):
-    if args.fp16:
-        with amp.scale_loss(_loss, optimizer_server) as _scaled_loss:
-            _scaled_loss.backward()
-    else:
-        _loss.backward()
+    _loss.backward()
 
     dfx_client = client_hidden_states.grad.clone().detach()
 
     if is_update and args.clip > 0:
-        if args.fp16:
-            torch.nn.utils.clip_grad_norm_(
-                amp.master_params(optimizer_server), args.clip
-            )
-        else:
-            torch.nn.utils.clip_grad_norm_(model_server.parameters(), args.clip)
-    optimizer_server.step()
-    optimizer_server.zero_grad()
+        torch.nn.utils.clip_grad_norm_(server_model.parameters(), args.clip)
+    server_optimizer.step()
+    server_optimizer.zero_grad()
 
     if _schedule is not None:
         _schedule.step()
 
     hidden_states.backward(dfx_client)
-    optimizer_client.step()
-    optimizer_client.zero_grad()
+    client_optimizer.step()
+    client_optimizer.zero_grad()
 
 
-def evaluate(model_client, model_server, valid_loader, args):
-    model_client.eval()
-    model_server.eval()
-    device = torch.device("cuda")
-    model_server = model_server.to(device)
+def evaluate(device, client_model, server_model, valid_dl):
+    device = device
+    client_model.eval()
+    server_model.eval()
+    server_model = server_model.to(device)
 
     avg_lm_loss = AverageMeter()
 
     with torch.no_grad():
-        for idx, data in enumerate(valid_loader):
+        for idx, data in enumerate(valid_dl):
             data = {key: value.to(device) for key, value in data.items()}
 
             _input = data["input"]
             _target = data["target"]
             _msk = data["mask"]
 
-            hidden_states, presents, _ = model_client(_input)
-
-            _, _loss = model_server(
+            hidden_states, presents, _ = client_model(_input)
+            _, _loss = server_model(
                 _input.shape, hidden_states, presents, lm_labels=_target, lm_mask=_msk
             )
             loss = _loss.mean()
-
             avg_lm_loss.update(loss.item())
-
             if idx % 100 == 0:
                 print("eval samples:", idx, "loss:", loss.float())
-
-        print("average loss", avg_lm_loss.avg)
+        print("Average loss", avg_lm_loss.avg)
     return avg_lm_loss.avg, math.exp(avg_lm_loss.avg)
 
 
-def train_validate(
-    model_client,
-    model_server,
+def train(
+    config,
+    device,
+    client_model,
+    server_model,
     client_models,
     optimizers,
-    optimizer_server,
-    scheduler_server,
-    train_loader0,
-    train_loader1,
-    train_loader2,
-    valid_loader,
-    args,
+    server_optimizer,
+    server_scheduler,
+    train_dl_c0,
+    train_dl_c1,
+    train_dl_c2,
+    valid_dl,
     train_step=0,
     epoch=0,
 ):
-    """
-    Function to train and validate federated learning models.
+    client_model.train()
+    server_model.train()
 
-    Args:
-        model_Client (torch.nn.Module): Client-side GPT-2 model.
-        model_Server (torch.nn.Module): Server-side GPT-2 model.
-        client_models (list): List of client GPT-2 models.
-        optimizers (list): Optimizers for client models.
-        optimizer_Server (torch.optim.Optimizer): Optimizer for server model.
-        scheduler_Server (torch.optim.lr_scheduler): Learning rate scheduler for server optimizer.
-        train_loader0, train_loader1, train_loader2 (torch.utils.data.DataLoader): Train loaders for three clients.
-        valid_loader (torch.utils.data.DataLoader): Validation loader.
-        args (argparse.Namespace): Command-line arguments.
-        train_step (int, optional): Current training step. Default is 0.
-        epoch (int, optional): Current epoch. Default is 0.
-
-    Returns:
-        Train step
-    """
-    model_client.train()
-    model_server.train()
-    # Meter to average language model loss
     avg_lm_loss = AverageMeter()
-    print("start to train the model................", epoch)
+    print("Training Start", epoch)
     log_start_time = time.time()
 
-    # Meter to average language model loss
     best_val_ppl = None
 
-    device = torch.device("cuda")
-    train_loader0.sampler.set_epoch(epoch)
+    device = device
 
-    # Initialize global client model
-    net_glob_client = ClientGPT2LMModel(config)
-    net_glob_client = net_glob_client.to(device)
-    # Load weights to global client model
-    net_glob_client.load_weight(state_dict)
+    global_client_net = ClientGPT2LMModel(config)
+    global_client_net = global_client_net.to(device)
+
+    global_client_net.load_weight(state_dict)
     if args.lora_dim > 0:
-        lora.mark_only_lora_as_trainable(net_glob_client)
-    net_glob_client.train()
-    w_glob_client = net_glob_client.state_dict()
+        lora.mark_only_lora_as_trainable(global_client_net)
+    global_client_net.train()
+    global_client_weight = global_client_net.state_dict()
 
-    # aggregate every 100 train_step
     aggregate_step = 100
-
     w_locals_client = []
 
-    # get train data from different client train dataset
-    for idx, data in enumerate(zip(train_loader0, train_loader1, train_loader2)):
-        # The client interacts with the server in turn
+    for idx, data in enumerate(zip(train_dl_c0, train_dl_c1, train_dl_c2)):
         for i in range(num_clients):
             client_data = {key: value.to(device) for key, value in data[i].items()}
 
@@ -263,7 +141,7 @@ def train_validate(
 
             client_hidden_states = hidden_states.clone().detach().requires_grad_(True)
 
-            _, _lm_loss = model_server(
+            _, _lm_loss = server_model(
                 _input.shape,
                 client_hidden_states,
                 presents,
@@ -279,21 +157,19 @@ def train_validate(
 
             optimizer_step(
                 _lm_loss / args.grad_acc,
-                optimizer_server,
-                model_server,
+                server_optimizer,
+                server_model,
                 optimizers[i],
-                scheduler_server,
+                server_scheduler,
                 client_hidden_states,
                 hidden_states,
                 args,
                 is_update=is_update,
             )
 
-            # aggregate  client LoRA model every 100 train_step
             if train_step % aggregate_step == 0:
                 temp_dict = {}
-                w_locals_client_lora = []  # only aggregate lora-values
-
+                w_locals_client_lora = []
                 for w_client in w_locals_client:
                     for key, value in w_client.items():
                         if key.endswith("lora_A"):
@@ -301,57 +177,48 @@ def train_validate(
                         if key.endswith("lora_B"):
                             temp_dict[key] = value
                     w_locals_client_lora.append(copy.deepcopy(temp_dict))
-
                 w_glob_client_lora = fed_avg(w_locals_client_lora)
 
                 w_glob_client_lora_new = {}
-
                 for key, value in w_glob_client_lora.items():
                     new_key = "transformer_Client." + key
                     w_glob_client_lora_new[new_key] = value
-
-                for key, _ in w_glob_client.items():
+                for key, _ in global_client_weight.items():
                     if key.endswith("lora_A"):
-                        w_glob_client[key] = w_glob_client_lora_new[key]
+                        global_client_weight[key] = w_glob_client_lora_new[key]
                     if key.endswith("lora_B"):
-                        w_glob_client[key] = w_glob_client_lora_new[key]
+                        global_client_weight[key] = w_glob_client_lora_new[key]
 
-                net_glob_client.load_state_dict(w_glob_client)
-                for client_model in client_models:
-                    client_model.load_state_dict(w_glob_client)
+                global_client_net.load_state_dict(global_client_weight)
+                for client_model_ in client_models:
+                    client_model_.load_state_dict(global_client_weight)
 
                 w_locals_client = []
 
-            # Output the training process data
             if train_step % args.log_interval == 0:
                 elapsed = time.time() - log_start_time
-                lr = optimizer_server.param_groups[0]["lr"]
+                lr = server_optimizer.param_groups[0]["lr"]
                 log_str = (
                     f"| epoch {epoch:3d} step {train_step:>8d} | {idx*3 + 1:>6d} batches | "
                     f"lr {lr:.3g} | ms/batch {elapsed * 1000 / args.log_interval:5.2f} | "
                     f"loss {avg_lm_loss.val:5.2f} | avg loss {avg_lm_loss.avg:5.2f} | "
                     f"ppl {math.exp(avg_lm_loss.avg):5.2f}"
                 )
-
-                log_list.append(log_str)
-
-                if args.rank == 0:
-                    print(log_str)
+                print(log_str)
+                wandb.log({"train/step/train_loss": avg_lm_loss.val, "train/step/lr": lr, "train/step/ppl": math.exp(avg_lm_loss.val)}, step=train_step)
                 log_start_time = time.time()
                 avg_lm_loss.reset()
 
             # save checkpoint at each save_interval
             if train_step % args.save_interval == 0:
                 save_checkpoint(
-                    w_glob_client, model_server, args, train_step, num_clients
+                    config, global_client_weight, server_model, train_step, num_clients
                 )
-            distributed_sync(args)
 
             if train_step % args.eval_interval == 0:
                 eval_start_time = time.time()
-
                 valid_loss, valid_ppl = evaluate(
-                    net_glob_client, model_server, valid_loader, args
+                    global_client_net, server_model, valid_dl, args
                 )
                 if best_val_ppl is None or valid_ppl < best_val_ppl:
                     best_val_ppl = valid_ppl
@@ -361,248 +228,72 @@ def train_validate(
                     f"time: {time.time() - eval_start_time:5.2f}s | valid loss {valid_loss:5.2f} | "
                     f"valid ppl {valid_ppl:5.2f} | best ppl {best_val_ppl:5.2f} "
                 )
-                log_list.append(log_str)
 
-                if args.rank == 0:
-                    print("-" * 100)
-                    print(log_str)
-                    print("-" * 100)
+                print("=" * 100)
+                print(log_str)
+                print("=" * 100)
+                wandb.log({"valid/train_loss": valid_loss, "valid/ppl": math.exp(valid_ppl)})
 
-                net_glob_client.train()
-                model_server.train()
-                distributed_sync(args)
+                global_client_net.train()
+                server_model.train()
 
             # Save training process
-            if train_step == args.max_step:
-                df = pd.DataFrame(log_list, columns=["Log"])
-                df.to_excel(
-                    f"{args.model_card} rank={args.lora_dim} num={num_clients} block=3 seed={args.random_seed}.xlsx",
-                    sheet_name="Sheet1",
-                    index=False,
-                )
+            if train_step == config["scheduler"]["max_step"]:
                 break
 
     # Save the final checkpoint
-    if train_step == args.max_step:
-        save_checkpoint(w_glob_client, model_server, args, train_step, num_clients)
-    distributed_sync(args)
+    if train_step == config["scheduler"]["max_step"]:
+        save_checkpoint(config, global_client_weight, server_model, train_step, num_clients)
+
     return train_step
 
 
+def load_config(config_file):
+    with open(config_file, 'r') as f:
+        return json.load(f)
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SplitLoRA Script")
-
-    add_gpu_params(parser)
-    add_optimizer_params(parser)
-
-    parser.add_argument(
-        "--train_data0", required=True, help="location of training data corpus"
-    )
-    parser.add_argument(
-        "--train_data1", required=True, help="location of training data corpus"
-    )
-    parser.add_argument(
-        "--train_data2", required=True, help="location of training data corpus"
-    )
-    parser.add_argument(
-        "--valid_data", required=True, help="location of validation data corpus"
-    )
-    parser.add_argument(
-        "--train_batch_size", type=int, default=8, help="training batch size"
-    )
-    parser.add_argument(
-        "--valid_batch_size", type=int, default=4, help="validation batch size"
-    )
-    parser.add_argument(
-        "--grad_acc", type=int, default=1, help="gradient accumulation steps"
-    )
-    parser.add_argument("--clip", type=float, default=0.0, help="gradient clip")
-    parser.add_argument(
-        "--seq_len", type=int, default=512, help="number of tokens to predict."
-    )
-    parser.add_argument(
-        "--model_card",
-        default="gpt2.md",
-        choices=["gpt2.sm", "gpt2.md", "gpt2.lg"],
-        help="model names",
-    )
-    parser.add_argument(
-        "--init_checkpoint", default=None, help="pretrained checkpoint path"
-    )
-    parser.add_argument("--fp16", action="store_true", help="train model with fp16")
-    parser.add_argument("--log_interval", type=int, default=100, help="log interval")
-    parser.add_argument("--eval_interval", type=int, default=2000, help="eval interval")
-    parser.add_argument("--save_interval", type=int, default=500, help="save interval")
-    parser.add_argument(
-        "--work_dir",
-        type=str,
-        default=os.getenv("PT_OUTPUT_DIR", "gpt2_model"),
-        help="working folder.",
-    )
-    parser.add_argument("--lora_dim", type=int, default=0, help="lora attn dimension")
-    parser.add_argument("--lora_alpha", type=int, default=128, help="lora attn alpha")
-    parser.add_argument(
-        "--obj",
-        default="clm",
-        choices=["jlm", "clm"],
-        help="language model training objective",
-    )
-    parser.add_argument(
-        "--lora_dropout",
-        default=0.0,
-        type=float,
-        help="dropout probability for lora layers",
-    )
-    parser.add_argument(
-        "--label_smooth", default=0.0, type=float, help="label smoothing"
-    )
-    parser.add_argument(
-        "--roll_interval", type=int, default=-1, help="rolling interval"
-    )
-    parser.add_argument(
-        "--roll_lr", type=float, default=0.00001, help="rolling learning rate"
-    )
-    parser.add_argument("--roll_step", type=int, default=100, help="rolling step")
-    parser.add_argument(
-        "--eval_epoch", type=int, default=1, help="eval per number of epochs"
-    )
+    parser.add_argument("--config", required=True, help="Path to the JSON configuration file")
     args = parser.parse_args()
 
-    parse_gpu(args)
-    print_args(args)
+    config = load_config(args.config)
 
-    if args.fp16:
-        try:
-            from apex import amp
-        except Exception:
-            warnings.warn(
-                "Could not import amp, apex may not be installed", stacklevel=1
-            )
+    torch.manual_seed(config["distributed"]["random_seed"])
+    device = torch.device('cuda' if torch.cuda.is_available() else "cpu")
 
-    torch.manual_seed(args.random_seed)
-    random.seed(args.random_seed)
+    if not os.path.exists(config["training"]["work_dir"]):
+        os.makedirs(config["training"]["work_dir"])
 
-    if args.rank == 0:
-        args.logging = create_exp_dir(args.work_dir)
+    train_dl_c0, train_dl_c1, train_dl_c2, valid_dl = get_dataloaders(config=config)
 
-    # Create train dataset and valid dataset
-    train_data0 = FTDataset(
-        args.train_data0,
-        args.train_batch_size,
-        args.seq_len,
-        joint_lm=args.obj == "jlm",
+    model_configuration = GPT2Config(
+        n_embd=768,
+        n_layer=12,
+        n_head=12,
+        lora_attn_dim=config["lora"]["lora_dim"],
+        lora_attn_alpha=config["lora"]["lora_alph"],
+        lora_dropout=config["lora"]["lora_dropout"],
+        split_point=config["model"]["split_point"]
     )
+    gpt_client = ClientGPT2LMModel(model_configuration)
+    gpt_server = ServerGPT2LMModel(model_configuration)
 
-    train_data1 = FTDataset(
-        args.train_data1,
-        args.train_batch_size,
-        args.seq_len,
-        joint_lm=args.obj == "jlm",
-    )
-
-    train_data2 = FTDataset(
-        args.train_data2,
-        args.train_batch_size,
-        args.seq_len,
-        joint_lm=args.obj == "jlm",
-    )
-
-    valid_data = FTDataset(
-        args.valid_data,
-        args.valid_batch_size,
-        args.seq_len,
-    )
-
-    train_loader0 = DataLoader(
-        train_data0,
-        batch_size=args.train_batch_size,
-        num_workers=0,
-        pin_memory=False,
-        drop_last=True,
-        sampler=torch.utils.data.distributed.DistributedSampler(
-            train_data0, seed=args.random_seed, shuffle=True
-        ),
-    )
-
-    train_loader1 = DataLoader(
-        train_data1,
-        batch_size=args.train_batch_size,
-        num_workers=0,
-        pin_memory=False,
-        drop_last=True,
-        sampler=torch.utils.data.distributed.DistributedSampler(
-            train_data1, seed=args.random_seed, shuffle=True
-        ),
-    )
-
-    train_loader2 = DataLoader(
-        train_data2,
-        batch_size=args.train_batch_size,
-        num_workers=0,
-        pin_memory=False,
-        drop_last=True,
-        sampler=torch.utils.data.distributed.DistributedSampler(
-            train_data2, seed=args.random_seed, shuffle=True
-        ),
-    )
-    valid_loader = DataLoader(
-        valid_data,
-        batch_size=args.valid_batch_size,
-        num_workers=0,
-        shuffle=False,
-        pin_memory=False,
-        drop_last=False,
-        sampler=torch.utils.data.distributed.DistributedSampler(
-            valid_data, seed=args.random_seed
-        ),
-    )
-
-    if args.model_card == "gpt2.sm":
-        config = GPT2Config(
-            n_embd=768,
-            n_layer=12,
-            n_head=12,
-            lora_attn_dim=args.lora_dim,
-            lora_attn_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-        )
-    elif args.model_card == "gpt2.md":
-        config = GPT2Config(
-            n_embd=1024,
-            n_layer=24,
-            n_head=16,
-            lora_attn_dim=args.lora_dim,
-            lora_attn_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-        )
-    elif args.model_card == "gpt2.lg":
-        config = GPT2Config(
-            n_embd=1280,
-            n_layer=36,
-            n_head=20,
-            lora_attn_dim=args.lora_dim,
-            lora_attn_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-        )
-
-    lm_net_Client = ClientGPT2LMModel(config)
-    lm_net_Server = ServerGPT2LMModel(config)
-
-    state_dict = torch.load(args.init_checkpoint)
+    state_dict = torch.load(config["model"]["init_checkpoint"])
     if args.init_checkpoint is not None:
-        print("loading model pretrained weight.")
-        lm_net_Client.load_weight(state_dict)
-        lm_net_Server.load_weight(state_dict)
+        print(f"Loading pre-trained weight from {config["model"]["init_checkpoint"]}")
+        gpt_client.load_weight(state_dict)
+        gpt_server.load_weight(state_dict)
 
-    lm_net_Client = lm_net_Client.cuda()
-    lm_net_Server = lm_net_Server.cuda()
+    gpt_client = gpt_client.to(device=device)
+    gpt_server = gpt_server.to(device=device)
 
     if args.lora_dim > 0:
-        lora.mark_only_lora_as_trainable(lm_net_Client)
-        lora.mark_only_lora_as_trainable(lm_net_Server)
+        lora.mark_only_lora_as_trainable(gpt_client)
+        lora.mark_only_lora_as_trainable(gpt_server)
 
-    optimizer_Client = create_adam_optimizer_from_args(lm_net_Client, args)
-    optimizer_Server = create_adam_optimizer_from_args(lm_net_Server, args)
+    client_optimizer = get_optimizer(gpt_client, config)
+    server_optimizer = get_optimizer(gpt_server, config)
 
     # nums of clients:
     num_clients = 3
@@ -611,71 +302,45 @@ if __name__ == "__main__":
 
     # Create client models for different clients
     for _ in range(num_clients):
-        client_model = ClientGPT2LMModel(config)
+        client_model = ClientGPT2LMModel(model_configuration)
         client_model.load_weight(state_dict)
-        client_model = client_model.cuda()
+        client_model = client_model.to(device=device)
         if args.lora_dim > 0:
             lora.mark_only_lora_as_trainable(client_model)
-        optimizer = create_adam_optimizer_from_args(client_model, args)
+        optimizer = get_optimizer(client_model, config)
         client_models.append(client_model)
         optimizers.append(optimizer)
 
-    if args.max_step is None:
-        args.max_step = (
-            args.max_epoch * train_data0.num_batches * 3 + args.world_size - 1
-        ) // args.world_size
-        print("set max_step:", args.max_step)
-
-    scheduler_Client = create_optimizer_scheduler(optimizer_Client, args)
-    scheduler_Server = create_optimizer_scheduler(optimizer_Server, args)
-
-    if args.fp16:
-        lm_net_Client, optimizer_Client = amp.initialize(
-            lm_net_Client, optimizer_Client, opt_level="O1"
+    if config["scheduler"]["max_step"] is None:
+        config["scheduler"]["max_step"] = (
+            args.max_epoch * train_dl_c0.num_batches * 3
         )
-        lm_net_Server, optimizer_Server = amp.initialize(
-            lm_net_Server, optimizer_Server, opt_level="O1"
+        print("set max_step:", config["scheduler"]["max_step"])
+
+    client_scheduler = get_scheduler(client_optimizer, config)
+    server_scheduler = get_scheduler(server_optimizer, config)
+
+    train_step = 0
+    for epoch in itertools.count(start=1):
+        train_step = train(
+            config=config,
+            device=device,
+            model_client=gpt_client,
+            model_server=gpt_server,
+            client_models=client_models,
+            optimizers=optimizers,
+            optimizer_server=server_optimizer,
+            scheduler_server=server_scheduler,
+            train_loader0=train_dl_c0,
+            train_loader1=train_dl_c1,
+            train_loader2=train_dl_c2,
+            valid_loader=valid_dl,
+            train_step=train_step,
+            epoch=epoch,
         )
-    lm_net_Client, optimizer_Client = distributed_opt(
-        args, lm_net_Client, optimizer_Client, grad_acc=args.grad_acc
-    )
-    lm_net_Server, optimizer_Server = distributed_opt(
-        args, lm_net_Server, optimizer_Server, grad_acc=args.grad_acc
-    )
 
-    log_list = []
-
-    try:
-        train_step = 0
-        for epoch in itertools.count(start=1):
-            train_step = train_validate(
-                model_client=lm_net_Client,
-                model_server=lm_net_Server,
-                client_models=client_models,
-                optimizers=optimizers,
-                optimizer_server=optimizer_Server,
-                scheduler_server=scheduler_Server,
-                train_loader0=train_loader0,
-                train_loader1=train_loader1,
-                train_loader2=train_loader2,
-                valid_loader=valid_loader,
-                args=args,
-                train_step=train_step,
-                epoch=epoch,
-            )
-
-            if train_step >= args.max_step or (
-                args.max_epoch is not None and epoch >= args.max_epoch
-            ):
-                if args.rank == 0:
-                    print("-" * 100)
-                    print("End of training")
-                break
-    except KeyboardInterrupt:
-        if args.rank == 0:
-            print("-" * 100)
-            print("Exiting from training early")
-
-    distributed_sync(args)
-    print("cleanup dist ...")
-    cleanup(args)
+        if train_step >= config["scheduler"]["max_step"] or (
+            args.max_epoch is not None and epoch >= args.max_epoch
+        ):
+            print("End of the training session.")
+            break

@@ -3,7 +3,7 @@ import random
 
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import DataLoader, Dataset
 
 
 class LMOrderedIterator(object):
@@ -192,7 +192,7 @@ def padding_tokens(tokens, max_seq_length, pad_token, direct, max_context_length
     return pad_tokens, token_len
 
 
-class FTDataset(Dataset):
+class E2ENLGDataset(Dataset):
     def __init__(
         self,
         ft_file,
@@ -222,6 +222,16 @@ class FTDataset(Dataset):
         self.infix_len = infix_len
         self.prefix_cursor = prefix_cursor
         self.infix_cursor = infix_cursor
+
+    def read_ft_file(self, ft_file):
+        ft_samples = []
+        with open(ft_file, "r") as reader:
+            for line in reader:
+                items = json.loads(line.strip())
+                context = items["context"]
+                completion = items["completion"]
+                ft_samples.append([context, completion])
+        return ft_samples
 
     def __len__(self):
         return self.num_batches * self.batch_size
@@ -278,12 +288,60 @@ class FTDataset(Dataset):
         output["mask"] = torch.tensor(_msk, dtype=torch.float)
         return output
 
-    def read_ft_file(self, ft_file):
-        ft_samples = []
-        with open(ft_file, "r") as reader:
-            for line in reader:
-                items = json.loads(line.strip())
-                context = items["context"]
-                completion = items["completion"]
-                ft_samples.append([context, completion])
-        return ft_samples
+
+def get_dataloaders(config):
+    train_data_c0 = E2ENLGDataset(
+        config["data"]["train_data_c0"],
+        config["data"]["train_batch_size"],
+        config["data"]["seq_len"],
+        joint_lm=False,
+    )
+    train_data_c1 = E2ENLGDataset(
+        config["data"]["train_data_c1"],
+        config["data"]["train_batch_size"],
+        config["data"]["seq_len"],
+        joint_lm=False,
+    )
+    train_data_c2 = E2ENLGDataset(
+        config["data"]["train_data_c2"],
+        config["data"]["train_batch_size"],
+        config["data"]["seq_len"],
+        joint_lm=False,
+    )
+    valid_data = E2ENLGDataset(
+        config["data"]["valid_data"],
+        config["data"]["valid_batch_size"],
+        config["data"]["seq_len"],
+    )
+
+    train_loader_c0 = DataLoader(
+        train_data_c0,
+        batch_size=config["data"]["train_batch_size"],
+        num_workers=0,
+        pin_memory=False,
+        drop_last=True,
+    )
+    train_loader_c1 = DataLoader(
+        train_data_c1,
+        batch_size=config["data"]["train_batch_size"],
+        num_workers=0,
+        pin_memory=False,
+        drop_last=True,
+    )
+    train_loader_c2 = DataLoader(
+        train_data_c2,
+        batch_size=config["data"]["train_batch_size"],
+        num_workers=0,
+        pin_memory=False,
+        drop_last=True,
+    )
+    valid_loader = DataLoader(
+        valid_data,
+        batch_size=config["data"]["train_batch_size"],
+        num_workers=0,
+        shuffle=False,
+        pin_memory=False,
+        drop_last=False,
+    )
+
+    return train_loader_c0, train_loader_c1, train_loader_c2, valid_loader

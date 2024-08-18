@@ -343,6 +343,7 @@ class GPT2Config(object):
         lora_dropout=0.0,
         lora_r_dropout=0.0,
         fix_dropout=0.0,
+        split_point=3,
     ):
         self.vocab_size = vocab_size_or_config_json_file
         self.n_ctx = n_ctx
@@ -357,6 +358,7 @@ class GPT2Config(object):
         self.lora_dropout = lora_dropout
         self.lora_r_dropout = lora_r_dropout
         self.fix_dropout = fix_dropout
+        self.split_point = split_point
 
 
 class ClientGPT2LMModel(nn.Module):
