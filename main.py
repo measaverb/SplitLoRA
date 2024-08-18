@@ -41,8 +41,10 @@ def optimizer_step(
 
     dfx_client = client_hidden_states.grad.clone().detach()
 
-    if is_update and args.clip > 0:
-        torch.nn.utils.clip_grad_norm_(server_model.parameters(), args.clip)
+    if is_update and config["training"]["clip"] > 0:
+        torch.nn.utils.clip_grad_norm_(
+            server_model.parameters(), config["training"]["clip"]
+        )
     server_optimizer.step()
     server_optimizer.zero_grad()
 
@@ -109,12 +111,11 @@ def train(
 
     device = device
 
-    global_client_net = ClientGPT2LMModel(config)
+    global_client_net = ClientGPT2LMModel(model_configuration)
     global_client_net = global_client_net.to(device)
 
     global_client_net.load_weight(state_dict)
-    if args.lora_dim > 0:
-        lora.mark_only_lora_as_trainable(global_client_net)
+    lora.mark_only_lora_as_trainable(global_client_net)
     global_client_net.train()
     global_client_weight = global_client_net.state_dict()
 
@@ -147,16 +148,16 @@ def train(
                 presents,
                 lm_labels=_target,
                 lm_mask=_msk,
-                label_smooth=args.label_smooth,
+                label_smooth=config["model"]["label_smooth"],
             )
 
             _lm_loss = _lm_loss.mean()
 
-            is_update = train_step % args.grad_acc == 0
+            is_update = train_step % config["training"]["grad_acc"] == 0
             avg_lm_loss.update(_lm_loss.item())
 
             optimizer_step(
-                _lm_loss / args.grad_acc,
+                _lm_loss / config["training"]["grad_acc"],
                 server_optimizer,
                 server_model,
                 optimizers[i],
@@ -181,7 +182,7 @@ def train(
 
                 w_glob_client_lora_new = {}
                 for key, value in w_glob_client_lora.items():
-                    new_key = "transformer_Client." + key
+                    new_key = "client_transformer." + key
                     w_glob_client_lora_new[new_key] = value
                 for key, _ in global_client_weight.items():
                     if key.endswith("lora_A"):
@@ -195,36 +196,43 @@ def train(
 
                 w_locals_client = []
 
-            if train_step % args.log_interval == 0:
+            if train_step % config["training"]["log_interval"] == 0:
                 elapsed = time.time() - log_start_time
                 lr = server_optimizer.param_groups[0]["lr"]
                 log_str = (
                     f"| epoch {epoch:3d} step {train_step:>8d} | {idx*3 + 1:>6d} batches | "
-                    f"lr {lr:.3g} | ms/batch {elapsed * 1000 / args.log_interval:5.2f} | "
+                    f"lr {lr:.3g} | ms/batch {elapsed * 1000 / config['training']['log_interval']:5.2f} | "
                     f"loss {avg_lm_loss.val:5.2f} | avg loss {avg_lm_loss.avg:5.2f} | "
                     f"ppl {math.exp(avg_lm_loss.avg):5.2f}"
                 )
                 print(log_str)
-                wandb.log({"train/step/train_loss": avg_lm_loss.val, "train/step/lr": lr, "train/step/ppl": math.exp(avg_lm_loss.val)}, step=train_step)
+                # wandb.log(
+                #     {
+                #         "train/step/train_loss": avg_lm_loss.val,
+                #         "train/step/lr": lr,
+                #         "train/step/ppl": math.exp(avg_lm_loss.val),
+                #     },
+                #     step=train_step,
+                # )
                 log_start_time = time.time()
                 avg_lm_loss.reset()
 
             # save checkpoint at each save_interval
-            if train_step % args.save_interval == 0:
+            if train_step % config["training"]["save_interval"] == 0:
                 save_checkpoint(
                     config, global_client_weight, server_model, train_step, num_clients
                 )
 
-            if train_step % args.eval_interval == 0:
+            if train_step %  config["training"]["eval_interval"] == 0:
                 eval_start_time = time.time()
                 valid_loss, valid_ppl = evaluate(
-                    global_client_net, server_model, valid_dl, args
+                    device, global_client_net, server_model, valid_dl
                 )
                 if best_val_ppl is None or valid_ppl < best_val_ppl:
                     best_val_ppl = valid_ppl
 
                 log_str = (
-                    f"| Eval {train_step // args.eval_interval:3d} at step {train_step:>8d} | "
+                    f"| Eval {train_step //  config['training']['eval_interval']:3d} at step {train_step:>8d} | "
                     f"time: {time.time() - eval_start_time:5.2f}s | valid loss {valid_loss:5.2f} | "
                     f"valid ppl {valid_ppl:5.2f} | best ppl {best_val_ppl:5.2f} "
                 )
@@ -232,7 +240,9 @@ def train(
                 print("=" * 100)
                 print(log_str)
                 print("=" * 100)
-                wandb.log({"valid/train_loss": valid_loss, "valid/ppl": math.exp(valid_ppl)})
+                # wandb.log(
+                #     {"valid/loss": valid_loss, "valid/ppl": math.exp(valid_ppl)}
+                # )
 
                 global_client_net.train()
                 server_model.train()
@@ -243,54 +253,62 @@ def train(
 
     # Save the final checkpoint
     if train_step == config["scheduler"]["max_step"]:
-        save_checkpoint(config, global_client_weight, server_model, train_step, num_clients)
+        save_checkpoint(
+            config, global_client_weight, server_model, train_step, num_clients
+        )
 
     return train_step
 
 
 def load_config(config_file):
-    with open(config_file, 'r') as f:
+    with open(config_file, "r") as f:
         return json.load(f)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SplitLoRA Script")
-    parser.add_argument("--config", required=True, help="Path to the JSON configuration file")
+    parser.add_argument(
+        "--config", required=True, help="Path to the JSON configuration file"
+    )
     args = parser.parse_args()
 
     config = load_config(args.config)
+    # wandb.init(
+    #     project="splitlora-experiments",
+    #     name="train-splitlora-gpt2.sm-rank8-c6"
+    # )
 
     torch.manual_seed(config["distributed"]["random_seed"])
-    device = torch.device('cuda' if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     if not os.path.exists(config["training"]["work_dir"]):
         os.makedirs(config["training"]["work_dir"])
 
-    train_dl_c0, train_dl_c1, train_dl_c2, valid_dl = get_dataloaders(config=config)
+    num_batches, train_dl_c0, train_dl_c1, train_dl_c2, valid_dl = get_dataloaders(config=config)
 
     model_configuration = GPT2Config(
         n_embd=768,
         n_layer=12,
         n_head=12,
         lora_attn_dim=config["lora"]["lora_dim"],
-        lora_attn_alpha=config["lora"]["lora_alph"],
+        lora_attn_alpha=config["lora"]["lora_alpha"],
         lora_dropout=config["lora"]["lora_dropout"],
-        split_point=config["model"]["split_point"]
+        split_point=config["model"]["split_point"],
     )
     gpt_client = ClientGPT2LMModel(model_configuration)
     gpt_server = ServerGPT2LMModel(model_configuration)
 
     state_dict = torch.load(config["model"]["init_checkpoint"])
-    if args.init_checkpoint is not None:
-        print(f"Loading pre-trained weight from {config["model"]["init_checkpoint"]}")
+    if config["model"]["init_checkpoint"] is not None:
+        print("Loading pre-trained weight from", config["model"]["init_checkpoint"])
         gpt_client.load_weight(state_dict)
         gpt_server.load_weight(state_dict)
 
     gpt_client = gpt_client.to(device=device)
     gpt_server = gpt_server.to(device=device)
 
-    if args.lora_dim > 0:
-        lora.mark_only_lora_as_trainable(gpt_client)
-        lora.mark_only_lora_as_trainable(gpt_server)
+    lora.mark_only_lora_as_trainable(gpt_client)
+    lora.mark_only_lora_as_trainable(gpt_server)
 
     client_optimizer = get_optimizer(gpt_client, config)
     server_optimizer = get_optimizer(gpt_server, config)
@@ -305,15 +323,14 @@ if __name__ == "__main__":
         client_model = ClientGPT2LMModel(model_configuration)
         client_model.load_weight(state_dict)
         client_model = client_model.to(device=device)
-        if args.lora_dim > 0:
-            lora.mark_only_lora_as_trainable(client_model)
+        lora.mark_only_lora_as_trainable(client_model)
         optimizer = get_optimizer(client_model, config)
         client_models.append(client_model)
         optimizers.append(optimizer)
 
     if config["scheduler"]["max_step"] is None:
         config["scheduler"]["max_step"] = (
-            args.max_epoch * train_dl_c0.num_batches * 3
+            config["scheduler"]["max_epoch"] * num_batches * 3
         )
         print("set max_step:", config["scheduler"]["max_step"])
 
@@ -325,22 +342,22 @@ if __name__ == "__main__":
         train_step = train(
             config=config,
             device=device,
-            model_client=gpt_client,
-            model_server=gpt_server,
+            client_model=gpt_client,
+            server_model=gpt_server,
             client_models=client_models,
             optimizers=optimizers,
-            optimizer_server=server_optimizer,
-            scheduler_server=server_scheduler,
-            train_loader0=train_dl_c0,
-            train_loader1=train_dl_c1,
-            train_loader2=train_dl_c2,
-            valid_loader=valid_dl,
+            server_optimizer=server_optimizer,
+            server_scheduler=server_scheduler,
+            train_dl_c0=train_dl_c0,
+            train_dl_c1=train_dl_c1,
+            train_dl_c2=train_dl_c2,
+            valid_dl=valid_dl,
             train_step=train_step,
             epoch=epoch,
         )
 
         if train_step >= config["scheduler"]["max_step"] or (
-            args.max_epoch is not None and epoch >= args.max_epoch
+             config["scheduler"]["max_epoch"] is not None and epoch >= config["scheduler"]["max_epoch"]
         ):
             print("End of the training session.")
             break

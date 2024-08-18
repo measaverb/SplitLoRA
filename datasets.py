@@ -343,5 +343,6 @@ def get_dataloaders(config):
         pin_memory=False,
         drop_last=False,
     )
+    num_batches = train_data_c0.num_batches
 
-    return train_loader_c0, train_loader_c1, train_loader_c2, valid_loader
+    return num_batches, train_loader_c0, train_loader_c1, train_loader_c2, valid_loader

@@ -180,7 +180,7 @@ def get_optimizer(model, config, grouped_parameters=None):
         grouped_parameters,
         lr=config["optimizer"]["lr"],
         betas=(config["optimizer"]["adam_beta1"], config["optimizer"]["adam_beta2"]),
-        eps=config["optimizer"]["adam_epislon"],
+        eps=config["optimizer"]["adam_epsilon"],
         weight_decay=config["optimizer"]["weight_decay"],
         correct_bias=config["optimizer"]["correct_bias"],
     )

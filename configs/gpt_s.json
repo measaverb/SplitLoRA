@@ -35,10 +35,9 @@
   "training": {
     "grad_acc": 1,
     "clip": 0.0,
-    "fp16": false,
     "log_interval": 100,
-    "eval_interval": 2000,
-    "save_interval": 500,
+    "eval_interval": 300,
+    "save_interval": 200,
     "work_dir": "./trained_models/train-splitlora-gpt2sm-rank8"
   },
   "model": {

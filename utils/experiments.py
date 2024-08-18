@@ -36,7 +36,6 @@ def save_checkpoint(config, w_glob_client, model_server, train_step, num_clients
         if key.startswith("module.server_transformer"):
             new_key = key.replace("module.server_transformer", "module.transformer")
         else:
-            print(key)
             model_state_dict[key] = value
 
         if new_key.startswith("module.transformer.h."):
@@ -49,7 +48,7 @@ def save_checkpoint(config, w_glob_client, model_server, train_step, num_clients
 
     model_path = os.path.join(
         config["training"]["work_dir"],
-        f"model_sfl.{train_step}_r={config["lora"]["lora_dim"]}_c={config["model"]["split_point"]}_num={num_clients}_block=3.pt",
+        f'model_sfl.{train_step}_r={config["lora"]["lora_dim"]}_c={config["model"]["split_point"]}_num={num_clients}_block=3.pt',
     )
     print("Saving checkpoint to ", model_path)
     torch.save({"model_state_dict": model_state_dict}, model_path)
