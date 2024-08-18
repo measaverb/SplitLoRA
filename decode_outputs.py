@@ -118,7 +118,7 @@ if __name__ == "__main__":
                 _key = ref_unique[line_id]
 
             if keep:
-                if not _key in refer_dict:
+                if _key not in refer_dict:
                     refer_dict[_key] = {}
                     refer_dict[_key]["references"] = []
                 refer_dict[_key]["references"].append(

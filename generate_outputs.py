@@ -106,7 +106,7 @@ def _add_beam_candidate(
 
             batch_id = _i // num_beams
 
-            if not batch_id in best_score or best_score[batch_id] < _score:
+            if batch_id not in best_score or best_score[batch_id] < _score:
                 best_score[batch_id] = _score
                 best_sequence[batch_id][:cur_len] = history[_i]
 
