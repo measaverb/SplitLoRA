@@ -1,0 +1,28 @@
+{
+  "data": {
+    "test_data": "./data/e2e/test.jsonl",
+    "test_batch_size": 1,
+    "seq_len": 512,
+    "eval_len": 64,
+    "min_length": 0
+  },
+  "model": {
+    "model_card": "gpt2.sm",
+    "init_checkpoint": "./trained_models/train-splitlora-gpt2sm-rank8/model_sfl.600_r=8_c=3_num=3_block=3.pt"
+  },
+  "lora": {
+    "lora_dim": 8,
+    "lora_alpha": 32
+  },
+  "training": {
+    "work_dir": "./trained_models/train-splitlora-gpt2sm-rank8"
+  },
+  "generation": {
+    "beam": 10,
+    "length_penalty": 0.8,
+    "no_repeat_ngram_size": 4,
+    "repetition_penalty": 1.0,
+    "eos_token_id": [628],
+    "output_file": "beam_prediction.jsonl"
+  }
+}

@@ -566,3 +566,203 @@ class ServerGPT2LMModel(nn.Module):
 
         self.server_transformer.load_state_dict(new_state_dict, strict=False)
         self.set_tied()
+
+
+class GPT2Model(nn.Module):
+    def __init__(self, config):
+        super(GPT2Model, self).__init__()
+        self.n_layer = config.n_layer
+        self.n_embd = config.n_embd
+        self.n_vocab = config.vocab_size
+
+        self.wte = nn.Embedding(config.vocab_size, config.n_embd)
+        self.wpe = nn.Embedding(config.n_positions, config.n_embd)
+        block = Block(config.n_ctx, config, scale=True)
+        self.h = nn.ModuleList([copy.deepcopy(block) for _ in range(config.n_layer)])
+        self.ln_f = LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
+
+        self.config = config
+
+    def forward(
+        self,
+        input_ids,
+        position_ids=None,
+        token_type_ids=None,
+        past=None,
+        len_past=None,
+    ):
+        if past is None:
+            past_length = 0
+            past = [None] * len(self.h)
+        elif len_past is None:
+            # equal size for past. []
+            past_length = past[0][0].size(-2)
+
+        if position_ids is None and len_past is None:
+            position_ids = torch.arange(
+                past_length,
+                input_ids.size(-1) + past_length,
+                dtype=torch.long,
+                device=input_ids.device,
+            )
+            position_ids = position_ids.unsqueeze(0).expand_as(input_ids)
+        elif len_past is not None:
+            position_ids = (len_past).unsqueeze(1)  # .long()
+
+        input_shape = input_ids.size()
+        input_ids = input_ids.view(-1, input_ids.size(-1))
+        position_ids = position_ids.view(-1, position_ids.size(-1))
+
+        inputs_embeds = self.wte(input_ids)
+
+        position_embeds = self.wpe(position_ids)
+
+        if token_type_ids is not None:
+            token_type_ids = token_type_ids.view(-1, token_type_ids.size(-1))
+            token_type_embeds = self.wte(token_type_ids)
+        else:
+            token_type_embeds = 0
+        hidden_states = inputs_embeds + position_embeds + token_type_embeds
+        presents = []
+        for block, layer_past in zip(self.h, past):
+            hidden_states, present = block(
+                hidden_states, layer_past=layer_past, len_past=len_past
+            )
+            presents.append(present)
+        hidden_states = self.ln_f(hidden_states)
+        output_shape = input_shape + (hidden_states.size(-1),)
+        return hidden_states.view(*output_shape), presents
+
+
+class GPT2LMModel(nn.Module):
+    def __init__(self, config):
+        super(GPT2LMModel, self).__init__()
+        self.transformer = GPT2Model(config)
+        self.lm_head = GPT2LMHead(self.transformer.wte.weight, config)
+        self.apply(self._init_weights)
+
+    def set_tied(self):
+        """Make sure we are sharing the embeddings"""
+        self.lm_head.set_embeddings_weights(self.transformer.wte.weight)
+
+    def forward(
+        self,
+        input_ids,
+        lm_labels=None,
+        lm_mask=None,
+        past=None,
+        len_past=None,
+        label_smooth=0.0,
+        is_report_accuracy=False,
+    ):
+        _batch, _len = input_ids.shape
+        hidden_states, presents = self.transformer(
+            input_ids, past=past, len_past=len_past
+        )
+
+        # batch, seq, vocab
+        lm_logits = self.lm_head(hidden_states)
+
+        if lm_labels is not None:
+
+            if is_report_accuracy:
+                _pred_token = torch.argmax(lm_logits, dim=-1)
+                _hit = (_pred_token == lm_labels) * lm_mask
+
+                _t1_acc = torch.zeros(
+                    _batch, dtype=torch.float, device=input_ids.device
+                )
+                _all_acc = torch.zeros(
+                    _batch, dtype=torch.float, device=input_ids.device
+                )
+
+                for _b in range(0, _batch):
+                    for _i in range(0, _len):
+                        if lm_mask[_b, _i] >= 1.0:
+                            if _hit[_b, _i] > 0:
+                                _t1_acc[_b] = 1.0
+                            break
+
+                    _is_succ = True
+                    for _i in range(0, _len):
+                        if lm_mask[_b, _i] >= 1.0:
+                            if _hit[_b, _i] <= 0:
+                                _is_succ = False
+                                break
+
+                    if _is_succ:
+                        _all_acc[_b] = 1.0
+
+                # _t1_acc = _t1_acc * 1.0 / _batch
+                # _all_acc = _all_acc * 1.0 / _batch
+
+            if label_smooth > 0.0001:
+                logprobs = torch.nn.functional.log_softmax(
+                    lm_logits.view(-1, lm_logits.size(-1)), dim=-1
+                )
+                nll_loss = -logprobs.gather(
+                    dim=-1, index=lm_labels.view(-1).unsqueeze(1)
+                )
+                nll_loss = nll_loss.squeeze(1)
+                smooth_loss = -logprobs.mean(dim=-1)
+                loss = (1.0 - label_smooth) * nll_loss + label_smooth * smooth_loss
+                loss = loss.view(_batch, _len)
+            else:
+                loss_fct = nn.CrossEntropyLoss(ignore_index=-1, reduce=False)
+                loss = loss_fct(
+                    lm_logits.view(-1, lm_logits.size(-1)), lm_labels.view(-1)
+                ).view(_batch, _len)
+
+            if lm_mask is None:
+                lm_mask = torch.ones(loss.shape, dtype=loss.dtype, device=loss.device)
+            loss = loss * lm_mask
+
+            loss = loss.sum() / (lm_mask.sum() + 0.0001)
+
+            if is_report_accuracy:
+                return lm_logits, loss, _t1_acc, _all_acc
+            else:
+                return lm_logits, loss
+        return lm_logits, presents
+
+    def _init_weights(self, module):
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            module.weight.data.normal_(mean=0.0, std=0.02)
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+        if isinstance(module, nn.Linear) and module.bias is not None:
+            module.bias.data.zero_()
+
+    def load_weight(self, state_dict):
+        if "model_state_dict" in state_dict:
+            state_dict = state_dict["model_state_dict"]
+
+        state_dict_tmp = copy.deepcopy(state_dict)
+        old_keys = []
+        new_keys = []
+        for key in state_dict_tmp:
+            new_key = None
+            if key.endswith(".g"):
+                new_key = key[:-2] + ".weight"
+            elif key.endswith(".b"):
+                new_key = key[:-2] + ".bias"
+            elif key.endswith(".w"):
+                new_key = key[:-2] + ".weight"
+
+            if key.startswith("module.transformer."):
+                new_key = key[len("module.transformer.") :]
+
+            if new_key:
+                old_keys.append(key)
+                new_keys.append(new_key)
+
+        for old_key, new_key in zip(old_keys, new_keys):
+            state_dict[new_key] = state_dict.pop(old_key)
+
+        for n, p in self.transformer.named_parameters():
+            if n not in state_dict:
+                state_dict[n] = p
+
+        self.transformer.load_state_dict(state_dict, strict=False)
+        self.set_tied()

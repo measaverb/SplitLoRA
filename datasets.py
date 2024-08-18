@@ -337,7 +337,7 @@ def get_dataloaders(config):
     )
     valid_loader = DataLoader(
         valid_data,
-        batch_size=config["data"]["train_batch_size"],
+        batch_size=config["data"]["valid_batch_size"],
         num_workers=0,
         shuffle=False,
         pin_memory=False,
@@ -346,3 +346,21 @@ def get_dataloaders(config):
     num_batches = train_data_c0.num_batches
 
     return num_batches, train_loader_c0, train_loader_c1, train_loader_c2, valid_loader
+
+
+def get_test_dataloaders(config):
+    test_ds = E2ENLGDataset(
+        config["data"]["test_data"],
+        config["data"]["test_batch_size"],
+        config["data"]["seq_len"],
+        config["data"]["eval_len"],
+    )
+    test_dl = DataLoader(
+        test_ds,
+        batch_size=config["data"]["test_batch_size"],
+        num_workers=0,
+        shuffle=False,
+        pin_memory=False,
+        drop_last=False,
+    )
+    return test_ds.num_batches, test_dl
