@@ -34,7 +34,6 @@ def optimizer_step(
     _schedule,
     client_hidden_states,
     hidden_states,
-    args,
     is_update=True,
 ):
     _loss.backward()
@@ -164,7 +163,6 @@ def train(
                 server_scheduler,
                 client_hidden_states,
                 hidden_states,
-                args,
                 is_update=is_update,
             )
 
@@ -247,11 +245,9 @@ def train(
                 global_client_net.train()
                 server_model.train()
 
-            # Save training process
             if train_step == config["scheduler"]["max_step"]:
                 break
 
-    # Save the final checkpoint
     if train_step == config["scheduler"]["max_step"]:
         save_checkpoint(
             config, global_client_weight, server_model, train_step, num_clients
