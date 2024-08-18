@@ -69,6 +69,14 @@ if __name__ == "__main__":
     enc = encoder.get_encoder(args.vocab)
 
     ref_unique = None
+    output_ref_file = os.path.join(
+        os.path.dirname(args.sample_file), "decoded", "ref.txt"
+    )
+    output_pred_file = os.path.join(
+        os.path.dirname(args.sample_file), "decoded", "pred.txt"
+    )
+    if not os.path.exists(os.path.dirname(output_ref_file)):
+        os.makedirs(os.path.dirname(output_ref_file))
 
     if args.ref_unique_file is not None:
         print("reading ref_unique_file.")
@@ -83,7 +91,7 @@ if __name__ == "__main__":
 
     with open(args.sample_file, "r") as sample_reader, open(
         args.input_file, "r", encoding="utf8"
-    ) as input_reader, open(args.output_pred_file, "w", encoding="utf8") as pred_writer:
+    ) as input_reader, open(output_pred_file, "w", encoding="utf8") as pred_writer:
 
         refer_dict = {}
         context_list = []
@@ -144,7 +152,7 @@ if __name__ == "__main__":
         hypothesis = [refer_dict[s]["sample"] for s in refer_dict]
 
         if args.ref_type == "e2e":
-            with open(args.output_ref_file, "w", encoding="utf8") as ref_writer:
+            with open(output_ref_file, "w", encoding="utf8") as ref_writer:
                 for ref, hyp in zip(references, hypothesis):
                     for r in ref:
                         ref_writer.write(
@@ -156,12 +164,12 @@ if __name__ == "__main__":
                     )
 
         elif args.ref_type in ["webnlg", "dart"]:
-            if not os.path.exists(args.output_ref_file):
-                os.makedirs(args.output_ref_file)
+            if not os.path.exists(output_ref_file):
+                os.makedirs(output_ref_file)
 
             reference_writers = [
                 open(
-                    os.path.join(args.output_ref_file, f"reference{fid}"),
+                    os.path.join(output_ref_file, f"reference{fid}"),
                     "w",
                     encoding="utf8",
                 )

@@ -294,3 +294,5 @@ pyrightconfig.json
 data/
 pretrained_checkpoints/
 trained_models/
+vocab/
+ref_files/
