@@ -216,11 +216,12 @@ class ClientGPT2Model(nn.Module):
         self.n_layer = config.n_layer
         self.n_embd = config.n_embd
         self.n_vocab = config.vocab_size
+        self.client_layer = config.split_point
 
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)
         self.wpe = nn.Embedding(config.n_positions, config.n_embd)
         block = Block(config.n_ctx, config, scale=True)
-        self.h = nn.ModuleList([copy.deepcopy(block) for _ in range(3)])
+        self.h = nn.ModuleList([copy.deepcopy(block) for _ in range(self.client_layer)])
 
         self.config = config
 
@@ -281,11 +282,12 @@ class ServerGPT2Model(nn.Module):
         self.n_layer = config.n_layer
         self.n_embd = config.n_embd
         self.n_vocab = config.vocab_size
+        self.server_layer = self.n_layer - config.split_point
 
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)
         block = Block(config.n_ctx, config, scale=True)
         self.h = nn.ModuleList(
-            [copy.deepcopy(block) for _ in range(config.n_layer - 3)]
+            [copy.deepcopy(block) for _ in range(config.server_layer)]
         )
         self.ln_f = LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
 
