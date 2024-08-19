@@ -1,3 +1,4 @@
+import json
 import os
 
 import torch
@@ -18,6 +19,11 @@ class AverageMeter(object):
         self.sum += val * n
         self.count += n
         self.avg = self.sum / self.count
+
+
+def load_config(config_file):
+    with open(config_file, "r") as f:
+        return json.load(f)
 
 
 def save_checkpoint(config, w_glob_client, model_server, train_step, num_clients):

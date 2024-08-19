@@ -13,7 +13,7 @@ import wandb
 
 from datasets import get_dataloaders
 from networks import ClientGPT2LMModel, GPT2Config, ServerGPT2LMModel
-from utils.experiments import AverageMeter, save_checkpoint
+from utils.experiments import AverageMeter, load_config, save_checkpoint
 from utils.optimizer import get_optimizer, get_scheduler
 
 
@@ -256,11 +256,6 @@ def train(
         )
 
     return train_step
-
-
-def load_config(config_file):
-    with open(config_file, "r") as f:
-        return json.load(f)
 
 
 if __name__ == "__main__":
