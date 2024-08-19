@@ -57,5 +57,9 @@
     "roll_lr": 0.00001,
     "roll_step": 100,
     "eval_epoch": 1
+  },
+  "wandb": {
+    "logging": false,
+    "run_name": "train-splitlora-gpt2.sm-rank8"
   }
 }

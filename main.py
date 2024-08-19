@@ -204,14 +204,15 @@ def train(
                     f"ppl {math.exp(avg_lm_loss.avg):5.2f}"
                 )
                 print(log_str)
-                # wandb.log(
-                #     {
-                #         "train/step/train_loss": avg_lm_loss.val,
-                #         "train/step/lr": lr,
-                #         "train/step/ppl": math.exp(avg_lm_loss.val),
-                #     },
-                #     step=train_step,
-                # )
+                if config["wandb"]["logging"]:
+                    wandb.log(
+                        {
+                            "train/step/train_loss": avg_lm_loss.val,
+                            "train/step/lr": lr,
+                            "train/step/ppl": math.exp(avg_lm_loss.val),
+                        },
+                        step=train_step,
+                    )
                 log_start_time = time.time()
                 avg_lm_loss.reset()
 
@@ -221,7 +222,7 @@ def train(
                     config, global_client_weight, server_model, train_step, num_clients
                 )
 
-            if train_step %  config["training"]["eval_interval"] == 0:
+            if train_step % config["training"]["eval_interval"] == 0:
                 eval_start_time = time.time()
                 valid_loss, valid_ppl = evaluate(
                     device, global_client_net, server_model, valid_dl
@@ -238,9 +239,10 @@ def train(
                 print("=" * 100)
                 print(log_str)
                 print("=" * 100)
-                # wandb.log(
-                #     {"valid/loss": valid_loss, "valid/ppl": math.exp(valid_ppl)}
-                # )
+                if config["wandb"]["logging"]:
+                    wandb.log(
+                        {"valid/loss": valid_loss, "valid/ppl": math.exp(valid_ppl)}
+                    )
 
                 global_client_net.train()
                 server_model.train()
@@ -269,10 +271,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     config = load_config(args.config)
-    # wandb.init(
-    #     project="splitlora-experiments",
-    #     name="train-splitlora-gpt2.sm-rank8-c6"
-    # )
+    if config["wandb"]["logging"]:
+        wandb.init(project="splitlora-experiments", name=config["wandb"]["run_name"])
 
     torch.manual_seed(config["distributed"]["random_seed"])
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -280,7 +280,9 @@ if __name__ == "__main__":
     if not os.path.exists(config["training"]["work_dir"]):
         os.makedirs(config["training"]["work_dir"])
 
-    num_batches, train_dl_c0, train_dl_c1, train_dl_c2, valid_dl = get_dataloaders(config=config)
+    num_batches, train_dl_c0, train_dl_c1, train_dl_c2, valid_dl = get_dataloaders(
+        config=config
+    )
 
     model_configuration = GPT2Config(
         n_embd=768,
@@ -353,7 +355,8 @@ if __name__ == "__main__":
         )
 
         if train_step >= config["scheduler"]["max_step"] or (
-             config["scheduler"]["max_epoch"] is not None and epoch >= config["scheduler"]["max_epoch"]
+            config["scheduler"]["max_epoch"] is not None
+            and epoch >= config["scheduler"]["max_epoch"]
         ):
             print("End of the training session.")
             break
