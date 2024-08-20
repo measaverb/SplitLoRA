@@ -296,3 +296,4 @@ pretrained_checkpoints/
 trained_models/
 vocab/
 ref_files/
+prerequisites.zip

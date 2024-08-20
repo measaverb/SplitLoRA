@@ -7,7 +7,6 @@ import time
 
 import loralib as lora
 import torch
-import torch.distributed
 import wandb
 
 from datasets import get_dataloaders

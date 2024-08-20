@@ -1,0 +1,6 @@
+wandb
+transformers==3.3.1
+spacy
+tqdm
+tensorboard
+progress
