@@ -297,3 +297,4 @@ trained_models/
 vocab/
 ref_files/
 prerequisites.zip
+loralib.zip
