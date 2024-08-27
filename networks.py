@@ -286,9 +286,7 @@ class ServerGPT2Model(nn.Module):
 
         self.wte = nn.Embedding(config.vocab_size, config.n_embd)
         block = Block(config.n_ctx, config, scale=True)
-        self.h = nn.ModuleList(
-            [copy.deepcopy(block) for _ in range(self.server_layer)]
-        )
+        self.h = nn.ModuleList([copy.deepcopy(block) for _ in range(self.server_layer)])
         self.ln_f = LayerNorm(config.n_embd, eps=config.layer_norm_epsilon)
 
         self.config = config
