@@ -259,7 +259,7 @@ def train(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="SplitLoRA Script")
     parser.add_argument(
-        "--config", required=True, help="Path to the JSON configuration file"
+        "--config", "-c", required=True, help="Path to the JSON configuration file"
     )
     args = parser.parse_args()
 

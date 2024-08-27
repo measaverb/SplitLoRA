@@ -35,10 +35,10 @@
   "training": {
     "grad_acc": 1,
     "clip": 0.0,
-    "log_interval": 100,
-    "eval_interval": 300,
-    "save_interval": 200,
-    "work_dir": "./trained_models/train-splitlora-gpt2sm-rank8"
+    "log_interval": 10,
+    "eval_interval": 2000,
+    "save_interval": 10000,
+    "work_dir": "./trained_models/train-splitlora-gpt2sm-rank16"
   },
   "model": {
     "model_card": "gpt2.sm",
@@ -60,6 +60,6 @@
   },
   "wandb": {
     "logging": false,
-    "run_name": "train-splitlora-gpt2.sm-rank8"
+    "run_name": "train-splitlora-gpt2.sm-rank16"
   }
 }
