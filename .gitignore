@@ -298,3 +298,4 @@ vocab/
 ref_files/
 prerequisites.zip
 loralib.zip
+wandb/
