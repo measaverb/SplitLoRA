@@ -1,5 +1,5 @@
 wandb
-transformers==4.48.0
+transformers==4.53.0
 spacy
 tqdm
 tensorboard
